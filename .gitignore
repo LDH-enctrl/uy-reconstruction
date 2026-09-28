@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+03_openfhe_ptct_uy_reconstruction/uy_reconstruction_ptct
+04_openfhe_ctct_uy_reconstruction/uy_reconstruction_ctct
+# New local runs can be large. The archived reference results are tracked separately.
+01_plain_tac/results/*/
+02_plain_uy_reconstruction/results/*/
+03_openfhe_ptct_uy_reconstruction/results/*/
+04_openfhe_ctct_uy_reconstruction/results/*/

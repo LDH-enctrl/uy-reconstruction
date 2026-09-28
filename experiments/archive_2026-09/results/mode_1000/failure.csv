@@ -1,0 +1,2 @@
+requested_blocks,completed_blocks,completed_samples,block,sample,stage,operation,branch,message,last_level,last_towers,last_noiseScaleDegree,last_scalingFactor
+1000,149,598,149,2,ct_ct_multiply,q_2_1,production,"/home/leedonghyun/openfhe-development/src/pke/lib/encoding/ckkspackedencoding.cpp:l.453:Decode(): The decryption failed because the approximation error is too high. Check the parameters. ",0,21,1,5.76460752303439872e+17
