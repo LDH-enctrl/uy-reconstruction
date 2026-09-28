@@ -85,10 +85,13 @@ struct FailureState {
 } gFailure;
 
 struct EncryptedCoefficients {
-    std::array<Cipher, 4> p;
-    std::array<std::array<Cipher, 4>, 4> q;
-    std::array<Cipher, 4> muColumns;
-    std::array<Cipher, 4> myColumns;
+    // pMasks[sample][state_index] encrypts [P[sample][state_index],0,0,0].
+    std::array<std::array<Cipher, 4>, 4> pMasks;
+    // qMasks[sample][history] encrypts [q[sample][history],0,0,0].
+    std::array<std::array<Cipher, 4>, 4> qMasks;
+    // Reconstruction masks: [0,...,M_[row][column],...,0].
+    std::array<std::array<Cipher, 4>, 4> muMasks;
+    std::array<std::array<Cipher, 4>, 4> myMasks;
 };
 
 struct CsvFiles {
@@ -191,16 +194,19 @@ double InfinityNorm(const Vec4& value) {
     return result;
 }
 
-double MaxError(const Vec4& value, double expected) {
+double ActiveSlotError(const Vec4& value, double expected) {
+    return std::abs(value[0] - expected);
+}
+
+double InactiveSlotLeakage(const Vec4& value) {
     double result = 0.0;
-    for (double element : value)
-        result = std::max(result, std::abs(element - expected));
+    for (std::size_t slot = 1; slot < 4; ++slot)
+        result = std::max(result, std::abs(value[slot]));
     return result;
 }
 
-double Spread(const Vec4& value) {
-    const auto extrema = std::minmax_element(value.begin(), value.end());
-    return *extrema.second - *extrema.first;
+double SparseScalarErrorInf(const Vec4& value, double expected) {
+    return std::max(ActiveSlotError(value, expected), InactiveSlotLeakage(value));
 }
 
 CipherMetadata GetMetadata(const Cipher& ciphertext) {
@@ -237,9 +243,15 @@ Cipher EncryptVector(const CryptoContext<DCRTPoly>& cc, const PublicKey<DCRTPoly
     return cc->Encrypt(publicKey, cc->MakeCKKSPackedPlaintext(values, 1, 0, nullptr, kSlots));
 }
 
-Cipher EncryptReplicated(const CryptoContext<DCRTPoly>& cc, const PublicKey<DCRTPoly>& publicKey,
-                         double value) {
-    return EncryptVector(cc, publicKey, {value, value, value, value});
+Cipher EncryptSparseScalar(const CryptoContext<DCRTPoly>& cc,
+                           const PublicKey<DCRTPoly>& publicKey, double value) {
+    return EncryptVector(cc, publicKey, {value, 0.0, 0.0, 0.0});
+}
+
+Vec4 OneHot(std::size_t slot, double value) {
+    Vec4 result{};
+    result.at(slot) = value;
+    return result;
 }
 
 void WriteMetadataHeader(std::ostream& output, const std::string& prefix) {
@@ -276,8 +288,9 @@ void OpenCsvFiles(const Options& options, CsvFiles& files) {
         *stream << std::scientific << std::setprecision(17);
 
     files.sample << "block,within_block_sample,global_sample,y_nominal,y_physical,y_semantic,"
-                    "u_nominal,u_semantic,u_ckks,e_u_semantic_abs,e_u_nominal_abs,u_slot_spread";
-    for (const auto* name : {"plant_nominal", "plant_ckks", "plant_error", "u_slots"})
+                    "u_nominal,u_semantic,u_ckks,e_u_semantic_abs,e_u_nominal_abs,"
+                    "y_active_error,y_inactive_leakage,u_active_error,u_inactive_leakage";
+    for (const auto* name : {"plant_nominal", "plant_ckks", "plant_error", "y_slots", "u_slots"})
         WriteVecHeader(files.sample, name);
     WriteMetadataHeader(files.sample, "u");
     files.sample << '\n';
@@ -293,7 +306,8 @@ void OpenCsvFiles(const Options& options, CsvFiles& files) {
     files.bootstrap << "block,within_block_sample,u_semantic,bootstrap_scale,scaled_input_abs_max,num_iterations,iterative_precision_bits";
     WriteVecHeader(files.bootstrap, "u_pre");
     WriteVecHeader(files.bootstrap, "u_post");
-    files.bootstrap << ",e_u_pre,e_u_boot,e_u_total,max_slot_spread";
+    files.bootstrap << ",u_active_error_pre,u_inactive_leakage_pre,e_u_boot_inf,"
+                       "u_active_error_post,u_inactive_leakage_post";
     WriteMetadataHeader(files.bootstrap, "before_reduction");
     WriteMetadataHeader(files.bootstrap, "before_bootstrap");
     WriteMetadataHeader(files.bootstrap, "after_bootstrap");
@@ -362,29 +376,60 @@ Cipher AddAligned(const CryptoContext<DCRTPoly>& cc, Cipher lhs, Cipher rhs) {
     return cc->EvalAdd(lhs, rhs);
 }
 
-Cipher InnerReplicated(const CryptoContext<DCRTPoly>& cc, const Cipher& state,
-                       const Cipher& encryptedRow, CsvFiles& files, std::size_t block,
-                       long sample, const std::string& operation) {
-    Cipher weighted = MultiplyCiphertexts(cc, state, encryptedRow, files, block, sample, operation);
-    Cipher pair = cc->EvalAdd(weighted, cc->EvalRotate(weighted, 1));
-    return cc->EvalAdd(pair, cc->EvalRotate(pair, 2));
+Cipher SparseInnerEncrypted(
+    const CryptoContext<DCRTPoly>& cc, const Cipher& state,
+    const std::array<Cipher, 4>& encryptedMasks, CsvFiles& files,
+    std::size_t block, long sample, const std::string& operationPrefix) {
+    Cipher sum;
+    for (std::size_t stateIndex = 0; stateIndex < 4; ++stateIndex) {
+        Cipher rotated = stateIndex == 0
+                             ? state
+                             : cc->EvalRotate(state, static_cast<int32_t>(stateIndex));
+        Cipher term = MultiplyCiphertexts(
+            cc, rotated, encryptedMasks[stateIndex], files, block, sample,
+            operationPrefix + "_x" + std::to_string(stateIndex));
+        sum = sum ? AddAligned(cc, sum, term) : term;
+    }
+    return sum;
+}
+
+Cipher ScatterEncrypted(
+    const CryptoContext<DCRTPoly>& cc, const Cipher& sparseScalar,
+    const std::array<Cipher, 4>& encryptedMasks, CsvFiles& files,
+    std::size_t block, long sample, const std::string& operationPrefix,
+    double coefficientScale = 1.0) {
+    Cipher sum;
+    for (std::size_t row = 0; row < 4; ++row) {
+        Cipher placed = row == 0
+                            ? sparseScalar
+                            : cc->EvalRotate(sparseScalar, -static_cast<int32_t>(row));
+        Cipher mask = encryptedMasks[row];
+        if (coefficientScale != 1.0)
+            mask = cc->EvalMult(mask, coefficientScale);
+        Cipher term = MultiplyCiphertexts(
+            cc, placed, mask, files, block, sample,
+            operationPrefix + "_row" + std::to_string(row));
+        sum = sum ? AddAligned(cc, sum, term) : term;
+    }
+    return sum;
 }
 
 EncryptedCoefficients EncryptCoefficients(const CryptoContext<DCRTPoly>& cc,
                                           const PublicKey<DCRTPoly>& publicKey) {
     EncryptedCoefficients encrypted;
-    for (std::size_t i = 0; i < 4; ++i) {
-        encrypted.p[i] = EncryptVector(cc, publicKey, P[i]);
-        for (std::size_t j = 0; j < 4; ++j)
-            encrypted.q[i][j] = EncryptReplicated(cc, publicKey, q[i][j]);
-        Vec4 muColumn{};
-        Vec4 myColumn{};
+    for (std::size_t sample = 0; sample < 4; ++sample) {
+        for (std::size_t stateIndex = 0; stateIndex < 4; ++stateIndex)
+            encrypted.pMasks[sample][stateIndex] =
+                EncryptVector(cc, publicKey, OneHot(0, P[sample][stateIndex]));
+        for (std::size_t history = 0; history < 4; ++history)
+            encrypted.qMasks[sample][history] =
+                EncryptVector(cc, publicKey, OneHot(0, q[sample][history]));
         for (std::size_t row = 0; row < 4; ++row) {
-            muColumn[row] = M_u[row][i];
-            myColumn[row] = M_y[row][i];
+            encrypted.muMasks[sample][row] =
+                EncryptVector(cc, publicKey, OneHot(row, M_u[row][sample]));
+            encrypted.myMasks[sample][row] =
+                EncryptVector(cc, publicKey, OneHot(row, M_y[row][sample]));
         }
-        encrypted.muColumns[i] = EncryptVector(cc, publicKey, muColumn);
-        encrypted.myColumns[i] = EncryptVector(cc, publicKey, myColumn);
     }
     return encrypted;
 }
@@ -423,7 +468,7 @@ uint32_t EstimateBootstrapPrecisionBits(const CryptoContext<DCRTPoly>& cc,
                                         const PublicKey<DCRTPoly>& publicKey,
                                         const PrivateKey<DCRTPoly>& secretKey,
                                         std::size_t bootstrapInputLevel) {
-    const Vec4 probeValue{0.50, -0.375, 0.25, -0.125};
+    const Vec4 probeValue{0.50, 0.0, 0.0, 0.0};
     Cipher probe = EncryptVector(cc, publicKey, probeValue);
     probe = ReduceToLevel(cc, probe, bootstrapInputLevel);
     const Vec4 before = Decode(cc, secretKey, probe);
@@ -495,7 +540,7 @@ int main(int argc, char** argv) {
         cc->EvalBootstrapSetup(levelBudget, bsgsDim, kSlots, kCorrectionFactor);
         auto keys = cc->KeyGen();
         cc->EvalMultKeyGen(keys.secretKey);
-        cc->EvalRotateKeyGen(keys.secretKey, {1, 2});
+        cc->EvalRotateKeyGen(keys.secretKey, {1, 2, 3, -1, -2, -3});
         cc->EvalBootstrapKeyGen(keys.secretKey, kSlots);
 
         gFailure.stage = "coefficient_encryption";
@@ -528,15 +573,18 @@ int main(int argc, char** argv) {
         std::cout << "profile_note: for unstable_high, the ideal u/plant trajectory matches unstable_low, "
                      "but internal state/coefficient magnitudes are intentionally larger. "
                      "Do not interpret an earlier CKKS failure as physical closed-loop instability.\n";
-        std::cout << "per_block_operations: ct_ct_mult=18, relinearizations=18, "
-                     "product_rescales=18, pre_multiply_normalization_rescales=4, "
-                     "controller_coeff_ct_pt_mult=0, public_bootstrap_normalization_ct_pt_mult<=8, "
-                     "rotations=8, additions=21, production_bootstraps=4\n";
+        std::cout << "signal_representation: each y(t+i) and u(t+i) is encrypted separately "
+                     "as [value,0,0,0]; controller state remains [x1,x2,x3,x4]\n";
+        std::cout << "per_block_operations: ct_ct_mult=54, relinearizations=54, "
+                     "product_rescales=54, controller_coeff_ct_pt_mult=0, "
+                     "public_bootstrap_normalization_ct_pt_mult<=8, rotations=36, "
+                     "additions=49, production_bootstraps=4\n";
         std::cout << "fresh_bootstrap_probe="
                   << (options.freshBootstrapProbe ? "enabled" : "disabled")
                   << ", diagnostic_bootstraps_per_block="
                   << (options.freshBootstrapProbe ? 4 : 0) << '\n';
-        std::cout << "encrypted_once_at_setup: P=4, q=16, M_u_columns=4, M_y_columns=4\n";
+        std::cout << "encrypted_once_at_setup: P_sparse_masks=16, q_sparse_masks=16, "
+                     "M_u_sparse_masks=16, M_y_sparse_masks=16\n";
         std::cout << "compiler=" << __VERSION__
                   << ", hardware_concurrency=" << std::thread::hardware_concurrency();
 #ifdef _OPENMP
@@ -546,8 +594,20 @@ int main(int argc, char** argv) {
                   << (std::getenv("OMP_NUM_THREADS") ? std::getenv("OMP_NUM_THREADS") : "not set")
                   << '\n';
 
+        { // Verify the rotation convention assumed by sparse control/reconstruction.
+            const Vec4 probeState{1.0, 2.0, 3.0, 4.0};
+            Cipher probe = EncryptVector(cc, keys.publicKey, probeState);
+            const Vec4 left = Decode(cc, keys.secretKey, cc->EvalRotate(probe, 1));
+            Cipher sparseProbe = EncryptSparseScalar(cc, keys.publicKey, 1.0);
+            const Vec4 right = Decode(cc, keys.secretKey, cc->EvalRotate(sparseProbe, -1));
+            if (std::abs(left[0] - 2.0) > 1e-6 || std::abs(right[1] - 1.0) > 1e-6)
+                throw std::runtime_error("rotation convention smoke check failed");
+            std::cout << "rotation_smoke: Rot(+1) brings x2 to slot0; Rot(-1) moves "
+                         "sparse slot0 to slot1: PASS\n";
+        }
+
         gFailure.stage = "bootstrap_warmup";
-        Cipher warm = EncryptReplicated(cc, keys.publicKey, 0.0125);
+        Cipher warm = EncryptSparseScalar(cc, keys.publicKey, 0.0125);
         warm = ReduceToLevel(cc, warm, bootstrapInputLevel);
         (void)cc->EvalBootstrap(warm);
 
@@ -609,19 +669,24 @@ int main(int argc, char** argv) {
                 const double nominalY = Dot(C, nominalPlant);
                 const double nominalU = Dot(H, nominalController);
                 const double physicalY = Dot(C, encryptedPlant);
+                // Each measurement is a separate scalar ciphertext: [y(t+i),0,0,0].
                 measurementCiphertexts[sample] =
-                    EncryptReplicated(cc, keys.publicKey, physicalY);
-                semanticY[sample] = Decode(cc, keys.secretKey, measurementCiphertexts[sample])[0];
+                    EncryptSparseScalar(cc, keys.publicKey, physicalY);
+                const Vec4 decodedY = Decode(cc, keys.secretKey, measurementCiphertexts[sample]);
+                semanticY[sample] = decodedY[0];
                 semanticU[sample] = Dot(H, semanticState);
 
                 const auto evaluationBegin = Clock::now();
-                controlCiphertexts[sample] =
-                    InnerReplicated(cc, controllerCipher, encrypted.p[sample], files, block,
-                                    sample, "P_" + std::to_string(sample));
+                // Sparse scalar control ciphertext:
+                // [u(t+i),0,0,0] = sum_j Enc([P_i[j],0,0,0]) * Rot^j(c_x)
+                //                    + sum_h Enc([q_ih,0,0,0]) * c_y(t+h).
+                controlCiphertexts[sample] = SparseInnerEncrypted(
+                    cc, controllerCipher, encrypted.pMasks[sample], files, block, sample,
+                    "P_" + std::to_string(sample));
                 for (std::size_t history = 0; history < sample; ++history) {
                     Cipher term = MultiplyCiphertexts(
-                        cc, measurementCiphertexts[history], encrypted.q[sample][history], files,
-                        block, sample,
+                        cc, measurementCiphertexts[history],
+                        encrypted.qMasks[sample][history], files, block, sample,
                         "q_" + std::to_string(sample) + "_" + std::to_string(history));
                     controlCiphertexts[sample] =
                         AddAligned(cc, controlCiphertexts[sample], term);
@@ -631,22 +696,29 @@ int main(int argc, char** argv) {
                 const Vec4 decodedU = Decode(cc, keys.secretKey, controlCiphertexts[sample]);
                 const double ckksU = decodedU[0];
                 if (!smokeChecked) {
-                    const double semanticError = MaxError(decodedU, semanticU[sample]);
-                    std::cout << "scalar_smoke_u" << sample << "_expected=" << semanticU[sample]
-                              << ", max_abs_error=" << semanticError
-                              << ", slot_spread=" << Spread(decodedU) << '\n';
-                    if (semanticError > 1e-5 || Spread(decodedU) > 1e-5)
-                        throw std::runtime_error("replicated ct-ct scalar smoke check failed");
+                    const double activeError = ActiveSlotError(decodedU, semanticU[sample]);
+                    const double inactiveLeakage = InactiveSlotLeakage(decodedU);
+                    std::cout << "sparse_scalar_smoke_u" << sample
+                              << "_expected=" << semanticU[sample]
+                              << ", active_error=" << activeError
+                              << ", inactive_leakage=" << inactiveLeakage << '\n';
+                    if (std::max(activeError, inactiveLeakage) > 1e-5)
+                        throw std::runtime_error("sparse ct-ct scalar smoke check failed");
                 }
 
                 files.sample << block << ',' << sample << ',' << block * 4 + sample << ','
                              << nominalY << ',' << physicalY << ',' << semanticY[sample] << ','
                              << nominalU << ',' << semanticU[sample] << ',' << ckksU << ','
                              << std::abs(ckksU - semanticU[sample]) << ','
-                             << std::abs(ckksU - nominalU) << ',' << Spread(decodedU);
+                             << std::abs(ckksU - nominalU) << ','
+                             << ActiveSlotError(decodedY, physicalY) << ','
+                             << InactiveSlotLeakage(decodedY) << ','
+                             << ActiveSlotError(decodedU, semanticU[sample]) << ','
+                             << InactiveSlotLeakage(decodedU);
                 WriteVector(files.sample, nominalPlantBefore);
                 WriteVector(files.sample, encryptedPlantBefore);
                 WriteVector(files.sample, Subtract(encryptedPlantBefore, nominalPlantBefore));
+                WriteVector(files.sample, decodedY);
                 WriteVector(files.sample, decodedU);
                 WriteMetadata(files.sample, GetMetadata(controlCiphertexts[sample]));
                 files.sample << '\n';
@@ -724,7 +796,7 @@ int main(int argc, char** argv) {
                     gFailure.branch = "fresh_bootstrap_probe";
                     gFailure.stage = "fresh_bootstrap_probe";
                     gFailure.operation = "EvalBootstrap_fresh_u" + std::to_string(sample);
-                    Cipher fresh = EncryptReplicated(cc, keys.publicKey, rawPre[0]);
+                    Cipher fresh = EncryptSparseScalar(cc, keys.publicKey, rawPre[0]);
                     if (bootstrapScale != 1.0) {
                         fresh = cc->EvalMult(fresh, bootstrapScale);
                         fresh = NormalizeScaleDegree(cc, fresh);
@@ -754,9 +826,11 @@ int main(int argc, char** argv) {
                                 << bootstrapIterations << ',' << iterativePrecisionBits;
                 WriteVector(files.bootstrap, preEquivalent);
                 WriteVector(files.bootstrap, post);
-                files.bootstrap << ',' << MaxError(preEquivalent, semanticU[sample]) << ','
+                files.bootstrap << ',' << ActiveSlotError(preEquivalent, semanticU[sample]) << ','
+                                << InactiveSlotLeakage(preEquivalent) << ','
                                 << productionBootstrapError << ','
-                                << MaxError(post, semanticU[sample]) << ',' << Spread(post);
+                                << ActiveSlotError(post, semanticU[sample]) << ','
+                                << InactiveSlotLeakage(post);
                 WriteMetadata(files.bootstrap, before);
                 WriteMetadata(files.bootstrap, immediatelyBefore);
                 WriteMetadata(files.bootstrap, after);
@@ -772,14 +846,14 @@ int main(int argc, char** argv) {
             Cipher reconstructedU;
             Cipher reconstructedY;
             for (std::size_t column = 0; column < 4; ++column) {
-                Cipher muForBlock = encrypted.muColumns[column];
-                if (bootstrapScale != 1.0)
-                    muForBlock = cc->EvalMult(muForBlock, 1.0 / bootstrapScale);
-                Cipher uTerm = MultiplyCiphertexts(
-                    cc, bootstrapped[column], muForBlock, files, block, 4,
-                    "M_u_col_" + std::to_string(column));
-                Cipher yTerm = MultiplyCiphertexts(
-                    cc, measurementCiphertexts[column], encrypted.myColumns[column], files, block,
+                // u(t+column) and y(t+column) are separate sparse scalar ciphertexts.
+                // Scatter each active scalar slot into the four controller-state slots with
+                // one-hot encrypted reconstruction coefficients.
+                Cipher uTerm = ScatterEncrypted(
+                    cc, bootstrapped[column], encrypted.muMasks[column], files, block, 4,
+                    "M_u_col_" + std::to_string(column), 1.0 / bootstrapScale);
+                Cipher yTerm = ScatterEncrypted(
+                    cc, measurementCiphertexts[column], encrypted.myMasks[column], files, block,
                     4, "M_y_col_" + std::to_string(column));
                 reconstructedU = reconstructedU ? AddAligned(cc, reconstructedU, uTerm) : uTerm;
                 reconstructedY = reconstructedY ? AddAligned(cc, reconstructedY, yTerm) : yTerm;

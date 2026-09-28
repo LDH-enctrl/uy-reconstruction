@@ -1,113 +1,85 @@
-# CKKS 기반 동적 제어기와 $u,y$-Reconstruction 실험
+# CKKS 기반 동적 제어기와 u/y Reconstruction 실험
 
-이 저장소는 **동적 제어기의 내부 행렬 $F$가 stable 또는 unstable한 경우**,  
-$u,y$ history를 이용한 controller-state reconstruction과 CKKS 기반 암호화 구현에서 발생하는 수치 오차를 비교하기 위한 실험 코드입니다.
+이 저장소는 **동적 제어기의 내부 행렬 $F$가 stable 또는 unstable한 경우**, $u,y$ history를 이용한 controller-state reconstruction과 CKKS 기반 암호화 구현을 단계적으로 확인하기 위한 코드입니다.
 
-처음 보는 사람도 결과를 재현하고 구조를 따라갈 수 있도록 다음 네 단계로 구성했습니다.
+처음 보는 사람도 구조를 따라갈 수 있도록 다음 네 단계로 구성했습니다.
 
-1. **Plain TAC formulation**
-2. **Plain $u,y$-based state reconstruction**
-3. **OpenFHE CKKS $u,y$-reconstruction: pt-ct**
-4. **OpenFHE CKKS $u,y$-reconstruction: ct-ct**
+1. `01_plain_tac` — Plain TAC formulation
+2. `02_plain_uy_reconstruction` — Plain $u,y$-based reconstruction
+3. `03_openfhe_ptct_uy_reconstruction` — OpenFHE CKKS, PT-CT coefficients
+4. `04_openfhe_ctct_uy_reconstruction` — OpenFHE CKKS, CT-CT coefficients
 
-기본적인 권장 순서는 `01 → 02 → 03 → 04`입니다.
+> **중요:** 03/04에서 각 $u(t+i)$와 $y(t+i)$는 서로 다른 ciphertext입니다. Scalar signal은 `[value,0,0,0]` 형태로 표현하며 `[u,u,u,u]` 또는 `[y,y,y,y]` replicated packing을 사용하지 않습니다.
+
+자세한 ciphertext layout은 [`docs/ENCRYPTED_REPRESENTATION.md`](docs/ENCRYPTED_REPRESENTATION.md)를 먼저 확인하세요.
 
 ---
 
 ## 1. 문제 설정
 
-Plant는 다음과 같은 discrete-time LTI system을 사용합니다.
+Plant:
 
 ```math
-x_p(k+1)=Ax_p(k)+Bu(k),
+x_p(k+1)=Ax_p(k)+Bu(k)
 ```
-```math
-y(k)=Cx_p(k).
-```
-동적 제어기는
 
 ```math
-x_c(k+1)=Fx_c(k)+Gy(k),
+y(k)=Cx_p(k)
 ```
+
+Dynamic controller:
+
+```math
+x_c(k+1)=Fx_c(k)+Gy(k)
+```
+
 ```math
 u(k)=Hx_c(k)
 ```
-형태입니다.
 
-전체 closed-loop dynamics는
+전체 closed-loop matrix는
 
 ```math
-\begin{bmatrix}
-x_p(k+1)\\
-x_c(k+1)
-\end{bmatrix}
-=
-\underbrace{
+A_{cl}=
 \begin{bmatrix}
 A & BH\\
 GC & F
-\end{bmatrix}}_{A_{\mathrm{cl}}}
-\begin{bmatrix}
-x_p(k)\\
-x_c(k)
 \end{bmatrix}.
 ```
+
 이 저장소에서는 특히
 
 ```math
-\rho(F)>1,\qquad \rho(A_{\mathrm{cl}})<1
+\rho(F)>1,\qquad \rho(A_{cl})<1
 ```
-인 controller realization에서도 암호화 구현이 어떻게 동작하는지 살펴봅니다.
 
-즉, **closed loop는 안정하지만 controller realization 내부에는 unstable mode가 존재할 수 있는 경우**를 주요 관심 대상으로 둡니다.
+인 controller realization에서도 CKKS implementation이 어떻게 동작하는지 비교합니다.
 
 ---
 
 ## 2. Controller profile
 
-모든 실험에서는 동일한 인터페이스로 다음 세 가지 controller profile을 선택할 수 있습니다.
+모든 단계에서 다음 세 가지 profile을 공통으로 사용합니다.
 
-### `stable`
+| profile | $\rho(F)$ | $\rho(A_{cl})$ | 특징 |
+|---|---:|---:|---|
+| `stable` | 0.6000 | 0.6893 | Schur-stable $F$ baseline |
+| `unstable_low` | 1.0460 | 0.7852 | unstable $F$, 낮은 internal transient |
+| `unstable_high` | 1.0460 | 0.7852 | unstable $F$, 큰 internal transient |
 
-내부 controller matrix $F$가 Schur stable인 기준 case입니다.
+`unstable_high`는 `unstable_low`의 similarity-transformed realization입니다.
 
 ```math
-\rho(F)<1.
+F_h=TF_lT^{-1},\qquad G_h=TG_l,\qquad H_h=H_lT^{-1}.
 ```
-암호화 구현에서 가장 안정적인 baseline으로 사용합니다.
+
+초기 controller state도 함께 변환하므로 exact arithmetic에서는 두 profile의 ideal $u$와 plant trajectory가 동일합니다. 내부 realization의 numerical sensitivity만 크게 달라지도록 만든 비교 case입니다.
+
+자세한 내용은 [`docs/CONTROLLER_PROFILES.md`](docs/CONTROLLER_PROFILES.md)를 참고하세요.
 
 ---
 
-### `unstable_low`
-
-```math
-\rho(F)>1
-```
-이지만 finite-horizon 내부 증폭이 비교적 작은 controller realization입니다.
-
-현재 설정에서는
-
-```math
-\rho(F)\approx 1.0460,
-```
-```math
-\rho(A_{\mathrm{cl}})\approx 0.7852.
-```
-즉 controller 내부 $F$는 unstable이지만 전체 physical closed loop는 stable입니다.
-
----
-
-### `unstable_high`
-
-`unstable_low`와 동일한 closed-loop input-output behavior를 가지면서, controller realization 내부의 transient amplification이 더 크게 나타나도록 구성한 case입니다.
-
-두 realization은 exact arithmetic에서 동일한 $u(k)$와 plant trajectory $x_p(k)$를 생성하도록 구성되어 있습니다.
-
-따라서 `unstable_low`와 `unstable_high`를 비교하면 **closed-loop control problem 자체의 차이보다 controller realization의 numerical sensitivity 차이**를 보기 쉽습니다.
-
----
-
-## 3. Repository 구성
+## 3. Repository 구조
 
 ```text
 .
@@ -122,53 +94,7 @@ x_c(k)
 └── experiments/
 ```
 
-각 파트는 가능한 한 동일한 plant/controller parameter와 동일한 출력 형식을 사용합니다.
-
----
-
-# 4. Part 1 — Plain TAC formulation
-
-폴더:
-
-```text
-01_plain_tac/
-```
-
-이 단계에서는 암호화를 사용하지 않고, 기본 동적 제어기와 TAC 형태의 reformulation이 동일한 closed-loop behavior를 만드는지 확인합니다.
-
-기본 controller:
-
-```math
-x_c(k+1)=Fx_c(k)+Gy(k),
-\qquad
-u(k)=Hx_c(k).
-```
-TAC 형태:
-
-```math
-x_c(k+1)
-=
-(F-RH)x_c(k)+Gy(k)+Ru(k).
-```
-이 단계의 목적은 **controller reformulation 자체가 원래 controller와 동등함을 확인하는 것**입니다.
-
-### 실행 예시
-
-```bash
-python3 01_plain_tac/tac_plain.py --profile stable
-```
-
-```bash
-python3 01_plain_tac/tac_plain.py --profile unstable_low
-```
-
-```bash
-python3 01_plain_tac/tac_plain.py --profile unstable_high
-```
-
-결과는 해당 실험의 `results/` 폴더에 저장됩니다.
-
-주요 출력:
+모든 단계의 기본 결과는 가능한 한 다음 형식으로 통일합니다.
 
 ```text
 u.png
@@ -178,516 +104,215 @@ plant_state_error.png
 sample_trace.csv
 ```
 
-여기서
-
-```math
-e_u(k)=u_{\mathrm{test}}(k)-u_{\mathrm{ref}}(k)
-```
-및
-
-```math
-e_p(k)=x_{p,\mathrm{test}}(k)-x_{p,\mathrm{ref}}(k)
-```
-를 확인할 수 있습니다.
-
-Plain arithmetic에서는 정상 구현 시 두 오차가 floating-point roundoff 수준이어야 합니다.
+성공 여부는 controller-state error 하나가 아니라 **실제 control $u$와 plant trajectory $x_p$**를 우선해서 판단합니다. Controller-state error는 numerical mechanism을 보기 위한 diagnostic입니다.
 
 ---
 
-# 5. Part 2 — Plain $u,y$-based state reconstruction
-
-폴더:
-
-```text
-02_plain_uy_reconstruction/
-```
-
-이 단계에서는 최근의 control/output history를 이용해 controller state를 다시 구성합니다.
-
-Reconstruction horizon을 $\nu$라고 하면
-
-```math
-U_t=
-\begin{bmatrix}
-u(t)\\
-u(t+1)\\
-\vdots\\
-u(t+\nu-1)
-\end{bmatrix},
-```
-```math
-Y_t=
-\begin{bmatrix}
-y(t)\\
-y(t+1)\\
-\vdots\\
-y(t+\nu-1)
-\end{bmatrix}.
-```
-Observability matrix는
-
-```math
-\mathcal O_\nu=
-\begin{bmatrix}
-H\\
-HF\\
-\vdots\\
-HF^{\nu-1}
-\end{bmatrix}.
-```
-$\mathcal O_\nu$가 full column rank이면
-
-```math
-U_t
-=
-\mathcal O_\nu x_c(t)+T_\nu Y_t
-```
-로부터 controller state를 복원할 수 있습니다.
-
-결과적으로
-
-```math
-x_c(t+\nu)
-=
-M_uU_t+M_yY_t
-```
-형태의 reconstruction을 얻습니다.
-
----
-
-## Refresh period $K$와 reconstruction horizon $\nu$
-
-두 파라미터는 서로 다른 의미를 가집니다.
-
-- $K$: state reconstruction을 수행하는 주기
-- $\nu$: reconstruction에 사용하는 $u,y$ history 길이
-
-따라서 반드시
-
-```math
-K=\nu
-```
-일 필요는 없습니다.
-
-예를 들어
-
-```math
-K=12,\qquad \nu=4
-```
-처럼 설정할 수도 있습니다.
-
-### 실행 예시
-
-```bash
-python3 02_plain_uy_reconstruction/uy_reconstruction_plain.py \
-    --profile unstable_low \
-    --blocks 20 \
-    --period 4 \
-    --nu 4
-```
-
-또는
-
-```bash
-python3 02_plain_uy_reconstruction/uy_reconstruction_plain.py \
-    --profile unstable_low \
-    --blocks 20 \
-    --period 12 \
-    --nu 4
-```
-
-실행 시 다음 항목들을 함께 확인하는 것을 권장합니다.
-
-```text
-rho(F)
-rho(Acl)
-rank(O_nu)
-cond(O_nu)
-||Mu||_inf
-||My||_inf
-max |u error|
-max ||plant-state error||_inf
-```
-
----
-
-# 6. Part 3 — OpenFHE CKKS pt-ct reconstruction
-
-폴더:
-
-```text
-03_openfhe_ptct_uy_reconstruction/
-```
-
-Part 2의 $u,y$-reconstruction 구조를 CKKS ciphertext에 적용합니다.
-
-이 구현에서는 controller state와 input/output data는 ciphertext로 처리하지만, controller coefficient는 plaintext로 둡니다.
-
-예를 들어
-
-```math
-P_i x_c
-```
-연산은
-
-```math
-\operatorname{pt}(P_i)\odot c_x
-```
-형태로 수행합니다.
-
-Reconstruction도
-
-```math
-c_{x,\mathrm{next}}
-=
-\sum_i
-\operatorname{pt}(M_u[:,i])
-\odot
-Boot(c_{u_i})
-+
-\sum_i
-\operatorname{pt}(M_y[:,i])
-\odot
-c_{y_i}
-```
-형태입니다.
-
-따라서 이 단계는 **CKKS encrypted-state implementation의 baseline**으로 사용할 수 있습니다.
-
----
-
-## OpenFHE 준비
-
-이 파트부터 OpenFHE가 필요합니다.
-
-예시 환경:
-
-```text
-Ubuntu / WSL2
-C++
-OpenFHE
-CMake
-Python 3 (plot/result processing)
-```
-
-OpenFHE 설치 위치를 환경변수로 지정합니다.
-
-```bash
-export OPENFHE_ROOT="$HOME/openfhe-development"
-```
-
-### 실행 예시
-
-```bash
-./03_openfhe_ptct_uy_reconstruction/scripts/run.sh unstable_low 10
-```
-
-다른 profile도 동일하게 사용할 수 있습니다.
-
-```bash
-./03_openfhe_ptct_uy_reconstruction/scripts/run.sh stable 10
-```
-
-```bash
-./03_openfhe_ptct_uy_reconstruction/scripts/run.sh unstable_high 10
-```
-
----
-
-# 7. Part 4 — OpenFHE CKKS ct-ct reconstruction
-
-폴더:
-
-```text
-04_openfhe_ctct_uy_reconstruction/
-```
-
-이 단계에서는 controller coefficient까지 ciphertext로 암호화합니다.
-
-즉
-
-```math
-Enc(P_i)\odot Enc(x_c)
-```
-및
-
-```math
-Enc(M_u[:,i])
-\odot
-Boot(c_{u_i})
-```
-와 같은 ciphertext-ciphertext multiplication을 사용합니다.
-
-이 구현이 현재 장기 numerical-error 분석의 주요 대상입니다.
-
-### 실행 예시
-
-```bash
-./04_openfhe_ctct_uy_reconstruction/scripts/run.sh stable 10
-```
-
-```bash
-./04_openfhe_ctct_uy_reconstruction/scripts/run.sh unstable_low 10
-```
-
-```bash
-./04_openfhe_ctct_uy_reconstruction/scripts/run.sh unstable_high 10
-```
-
----
-
-# 8. 결과 파일
-
-가능한 한 모든 파트에서 동일한 결과 형식을 사용합니다.
-
-```text
-results/
-├── u.png
-├── plant_state.png
-├── u_error.png
-├── plant_state_error.png
-└── sample_trace.csv
-```
-
-### `u.png`
-
-Reference control input과 test/encrypted control input을 비교합니다.
-
-### `plant_state.png`
-
-Reference plant trajectory와 test/encrypted plant trajectory를 비교합니다.
-
-### `u_error.png`
-
-```math
-|u_{\mathrm{test}}(k)-u_{\mathrm{ref}}(k)|
-```
-를 표시합니다.
-
-### `plant_state_error.png`
-
-```math
-\|x_{p,\mathrm{test}}(k)-x_{p,\mathrm{ref}}(k)\|_\infty
-```
-를 표시합니다.
-
-이 저장소에서는 **controller-state error 자체를 최종 성공/실패 지표로 사용하지 않습니다.**
-
-주요 성능 평가는
-
-```math
-u(k)
-```
-와
-
-```math
-x_p(k)
-```
-의 차이를 기준으로 합니다.
-
-Controller-state numerical error는 내부 오차 메커니즘을 분석하기 위한 diagnostic으로 사용합니다.
-
----
-
-# 9. 현재까지의 주요 관찰
-
-현재 `unstable_low` ct-ct 실험에서는 block 단위 controller-internal numerical error가
-
-```math
-F^K
-```
-의 unstable mode와 매우 유사한 증가율을 보였습니다.
-
-특히 $K=4$인 경우
-
-```math
-\rho(F)^4
-\approx 1.19728
-```
-이며, 실제 same-measurement reference와의 controller-state numerical error에서도 이에 매우 가까운 block-wise growth가 반복적으로 관찰되었습니다.
-
-이 현상을 수식적으로 보면, 새로운 HE error가 없다고 가정한 경우 inherited controller-state error는
-
-```math
-\delta x_{j+1}
-=
-F^K\delta x_j
-```
-형태로 전달될 수 있습니다.
-
-다만 이것이 곧바로
-
-```math
-\rho(F)>1
-\Rightarrow
-\mathrm{physical\ closed\!-\!loop\ failure}
-```
-를 의미하는 것은 아닙니다.
-
-Physical closed-loop stability는
-
-```math
-A_{\mathrm{cl}}
-```
-에 의해 결정되며, 실제 암호화 구현에서는
-
-- controller-internal numerical error
-- bootstrap approximation error
-- ciphertext arithmetic error
-- replicated scalar representation의 불일치
-- actuator-visible control error
-
-를 구분해서 볼 필요가 있습니다.
-
----
-
-# 10. 추가 실험
-
-고급 진단 실험은
-
-```text
-experiments/
-```
-
-아래에 분리해 두었습니다.
-
-주요 실험은 다음과 같습니다.
-
-### Long-horizon experiment
-
-장시간 실행에서 control/plant error 및 CKKS approximation failure를 확인합니다.
-
-### Same-measurement controller-error experiment
-
-Reference controller와 encrypted controller에 동일한 measurement $y$를 입력해 controller-side numerical error만 분리합니다.
-
-### Post-bootstrap budget experiment
-
-Bootstrap 이후 남는 RNS tower/modulus budget을 변경해 error growth의 원인을 확인합니다.
-
-### Control-representation consistency experiment
-
-하나의 scalar control $u_i$를 표현하는 ciphertext가 이상적으로
-
-```math
-[u_i,u_i,u_i,u_i]
-```
-형태를 유지하는지 확인합니다.
-
-실제 CKKS 연산에서는 slot별 오차가 다르게 발생할 수 있으므로, 이를 actuator-visible scalar control error와 controller-internal representation error로 나누어 분석합니다.
-
----
-
-# 11. 권장 실행 순서
-
-처음 저장소를 보는 경우 아래 순서를 권장합니다.
-
-### Step 1
+## 4. Part 1 — Plain TAC
 
 ```bash
 python3 01_plain_tac/tac_plain.py --profile stable
-```
-
-### Step 2
-
-```bash
 python3 01_plain_tac/tac_plain.py --profile unstable_low
+python3 01_plain_tac/tac_plain.py --profile unstable_high
 ```
 
-### Step 3
+기본 controller
+
+```math
+x_c^+=Fx_c+Gy,\qquad u=Hx_c
+```
+
+와 TAC identity
+
+```math
+x_c^+=(F-RH)x_c+Gy+Ru
+```
+
+를 plain arithmetic에서 비교합니다.
+
+---
+
+## 5. Part 2 — Plain u/y reconstruction
+
+기본값은 refresh period $K=4$, reconstruction horizon $\nu=4$입니다.
 
 ```bash
 python3 02_plain_uy_reconstruction/uy_reconstruction_plain.py \
-    --profile unstable_low \
-    --blocks 20 \
-    --period 4 \
-    --nu 4
+  --profile unstable_low --blocks 50 --period 4 --nu 4
 ```
 
-### Step 4
-
-OpenFHE 환경을 준비한 뒤
+Plain 단계에서는 $K$와 $\nu$를 분리할 수 있습니다.
 
 ```bash
+python3 02_plain_uy_reconstruction/uy_reconstruction_plain.py \
+  --profile unstable_low --blocks 20 --period 12 --nu 4
+```
+
+Reconstruction은
+
+```math
+x_c(t+K)=M_uU+M_yY
+```
+
+형태로 구현합니다.
+
+---
+
+## 6. Part 3 — OpenFHE PT-CT
+
+여기부터 OpenFHE가 필요합니다.
+
+```bash
+export OPENFHE_ROOT="$HOME/openfhe-development"
+./03_openfhe_ptct_uy_reconstruction/scripts/build.sh
+./03_openfhe_ptct_uy_reconstruction/scripts/run.sh stable 10
 ./03_openfhe_ptct_uy_reconstruction/scripts/run.sh unstable_low 10
+./03_openfhe_ptct_uy_reconstruction/scripts/run.sh unstable_high 10
 ```
 
-### Step 5
+### Signal representation
 
-마지막으로 ct-ct 구현을 실행합니다.
+Controller state만 vector packing합니다.
+
+```math
+c_x\leftrightarrow[x_1,x_2,x_3,x_4].
+```
+
+각 measurement는 개별 sparse scalar ciphertext입니다.
+
+```math
+c_{y_i}\leftrightarrow[y(t+i),0,0,0].
+```
+
+각 control도 개별 sparse scalar ciphertext입니다.
+
+```math
+c_{u_i}\leftrightarrow[u(t+i),0,0,0].
+```
+
+PT-CT에서는 $P_i$, $q_{ij}$, $M_u$, $M_y$ coefficient를 plaintext one-hot mask로 사용합니다.
+
+---
+
+## 7. Part 4 — OpenFHE CT-CT
 
 ```bash
+./04_openfhe_ctct_uy_reconstruction/scripts/build.sh
+./04_openfhe_ctct_uy_reconstruction/scripts/run.sh stable 10
 ./04_openfhe_ctct_uy_reconstruction/scripts/run.sh unstable_low 10
+./04_openfhe_ctct_uy_reconstruction/scripts/run.sh unstable_high 10
 ```
 
-그 이후 `stable`, `unstable_low`, `unstable_high`를 서로 비교하는 것을 권장합니다.
+Signal layout은 Part 3과 동일합니다.
+
+다만 controller/reconstruction coefficient도 setup에서 ciphertext로 암호화합니다.
+
+Control 계산의 $P_i x$는 다음 구조입니다.
+
+```math
+[p_{i1},0,0,0]\odot[x_1,x_2,x_3,x_4]
+```
+
+```math
++[p_{i2},0,0,0]\odot[x_2,x_3,x_4,x_1]
+```
+
+```math
++[p_{i3},0,0,0]\odot[x_3,x_4,x_1,x_2]
+```
+
+```math
++[p_{i4},0,0,0]\odot[x_4,x_1,x_2,x_3]
+```
+
+따라서 결과는
+
+```math
+[P_i x,0,0,0]
+```
+
+입니다.
+
+$q_{ij}y_j$도 sparse scalar layout을 그대로 유지합니다.
+
+Reconstruction에서는 각 sparse scalar $u_i,y_i$를 state slot으로 rotation하여 one-hot $M_u,M_y$ coefficient와 곱합니다. 단순 replicated broadcast-sum은 사용하지 않습니다.
 
 ---
 
-# 12. Controller profile 비교 시 주의할 점
+## 8. OpenFHE diagnostic
 
-`stable`, `unstable_low`, `unstable_high`를 비교할 때 단순히
-
-```math
-\rho(F)
-```
-만 보는 것은 충분하지 않습니다.
-
-특히 unstable realization에서는 다음 값들도 함께 확인하는 것이 좋습니다.
+03/04에서는 ideal scalar layout이
 
 ```math
-\max_{1\le i\le K}\|F^i\|,
+[s,0,0,0]
 ```
-```math
-\|M_u\|,
-```
-```math
-\operatorname{cond}(\mathcal O_\nu),
-```
-그리고 실제 encrypted implementation에서의
+
+이므로 다음을 기록합니다.
+
+Active-slot error:
 
 ```math
-|e_u(k)|,
-\qquad
-\|e_p(k)\|_\infty.
+e_{active}=|\hat s_0-s|
 ```
-`unstable_low`와 `unstable_high`는 가능한 한 동일한 ideal closed-loop behavior를 유지하면서 controller realization의 internal numerical amplification 차이를 비교하기 위한 profile입니다.
+
+Inactive-slot leakage:
+
+```math
+e_{inactive}=\max_{r=1,2,3}|\hat s_r|.
+```
+
+`sample_trace.csv`와 `bootstrap_diagnostics.csv`에서 $u$와 $y$에 대해 이 값을 확인할 수 있습니다.
 
 ---
 
-# 13. 현재 연구 질문
+## 9. Python 환경
 
-현재 관심 있는 핵심 질문은 다음과 같습니다.
-
-> Stable physical closed loop 내부에서 CKKS 구현으로 추가되는 numerical-error dynamics는 어떤 형태를 가지며, 이 dynamics는 controller realization $F$, refresh period $K$, reconstruction horizon $\nu$와 어떻게 결합되는가?
-
-특히 일반적인 $K,\nu$에서
-
-```math
-\delta x_{j+1}
-=
-F^K\delta x_j+d_j
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
-형태의 controller-internal error model을 분석하고,
 
-이를 실제 control error
+Profile 검증:
 
-```math
-e_u
+```bash
+python3 tools/validate_profiles.py
 ```
-및 plant-state error
 
-```math
-e_p
+Sparse layout algebra 확인:
+
+```bash
+python3 tools/verify_sparse_layout.py
 ```
-로 연결하는 것이 현재 분석의 주요 방향입니다.
 
 ---
 
-## Repository
+## 10. 현재 advanced experiment 상태
 
-GitHub:
+이전 replicated-scalar OpenFHE 구현에서 생성된 long-horizon 결과는 현재 architecture의 결과로 사용하지 않습니다.
 
-`LDH-enctrl/uy-reconstruction`
+현재 v4에서는 corrected sparse-scalar implementation을 먼저 03/04에서 재검증한 뒤 다음 실험을 다시 수행할 예정입니다.
 
-이 저장소는 현재 연구 진행 과정에서 계속 업데이트될 예정입니다.
+- long-horizon PT-CT / CT-CT
+- same-measurement controller-error dynamics
+- post-bootstrap level/tower sweep
+- active-slot error / inactive-slot leakage
+- production-vs-fresh bootstrap comparison
+
+수정 내역은 [`docs/CORRECTION_FROM_V3.md`](docs/CORRECTION_FROM_V3.md)를 참고하세요.
+
+---
+
+## 11. 권장 실행 순서
+
+```text
+01_plain_tac
+    ↓
+02_plain_uy_reconstruction
+    ↓
+03_openfhe_ptct_uy_reconstruction
+    ↓
+04_openfhe_ctct_uy_reconstruction
+```
+
+OpenFHE는 먼저 `stable` profile로 3~10 blocks를 확인한 뒤 `unstable_low`, `unstable_high` 순서로 진행하는 것을 권장합니다.

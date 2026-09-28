@@ -85,8 +85,9 @@ Vec4 Scale(const Vec4& a,double s) { Vec4 r{}; for(size_t i=0;i<4;++i) r[i]=a[i]
 Vec4 Mv(const Mat4& m,const Vec4& v) { Vec4 r{}; for(size_t i=0;i<4;++i) for(size_t j=0;j<4;++j) r[i]+=m[i][j]*v[j]; return r; }
 double Dot(const Vec4& a,const Vec4& b) { double r=0; for(size_t i=0;i<4;++i) r+=a[i]*b[i]; return r; }
 double Inf(const Vec4& v) { double r=0; for(double x:v) r=std::max(r,std::abs(x)); return r; }
-double MaxErr(const Vec4& v,double x) { double r=0; for(double y:v) r=std::max(r,std::abs(y-x)); return r; }
-double Spread(const Vec4& v) { auto p=std::minmax_element(v.begin(),v.end()); return std::abs(*p.second-*p.first); }
+double ActiveError(const Vec4& v,double expected) { return std::abs(v[0]-expected); }
+double InactiveLeakage(const Vec4& v) { double r=0; for(size_t i=1;i<4;++i) r=std::max(r,std::abs(v[i])); return r; }
+double SparseErrorInf(const Vec4& v,double expected) { return std::max(ActiveError(v,expected),InactiveLeakage(v)); }
 double Inf8(const Vec8& v) { double r=0; for(double x:v) r=std::max(r,std::abs(x)); return r; }
 Vec8 Join(const Vec4&a,const Vec4&b) { Vec8 r{}; std::copy(a.begin(),a.end(),r.begin()); std::copy(b.begin(),b.end(),r.begin()+4); return r; }
 Vec8 Add8(const Vec8&a,const Vec8&b) { Vec8 r{}; for(size_t i=0;i<8;++i)r[i]=a[i]+b[i]; return r; }
@@ -99,11 +100,31 @@ Mat8 Acl(){ Mat8 r{}; for(size_t i=0;i<4;++i)for(size_t j=0;j<4;++j){r[i][j]=A[i
 
 CipherMetadata Meta(const Cipher& c){ return {c->GetLevel(),c->GetElements()[0].GetNumOfElements(),c->GetNoiseScaleDeg(),c->GetScalingFactor()}; }
 Vec4 Decode(const CryptoContext<DCRTPoly>&cc,const PrivateKey<DCRTPoly>&sk,const Cipher&c){ Plaintext p;cc->Decrypt(sk,c,&p);p->SetLength(4);const auto v=p->GetRealPackedValue();return {v[0],v[1],v[2],v[3]}; }
-Cipher EncryptRep(const CryptoContext<DCRTPoly>&cc,const PublicKey<DCRTPoly>&pk,double x){ std::vector<double>v(4,x);return cc->Encrypt(pk,cc->MakeCKKSPackedPlaintext(v,1,0,nullptr,4)); }
+Cipher EncryptSparseScalar(const CryptoContext<DCRTPoly>&cc,const PublicKey<DCRTPoly>&pk,double x){ const std::vector<double>v{x,0.0,0.0,0.0};return cc->Encrypt(pk,cc->MakeCKKSPackedPlaintext(v,1,0,nullptr,4)); }
 Cipher EncryptVec(const CryptoContext<DCRTPoly>&cc,const PublicKey<DCRTPoly>&pk,const Vec4&x){ const std::vector<double>v{x[0],x[1],x[2],x[3]};return cc->Encrypt(pk,cc->MakeCKKSPackedPlaintext(v,1,0,nullptr,4)); }
 Cipher MulPlain(const CryptoContext<DCRTPoly>&cc,const Cipher&c,const Vec4&v){ const std::vector<double>values{v[0],v[1],v[2],v[3]};auto p=cc->MakeCKKSPackedPlaintext(values,c->GetNoiseScaleDeg(),c->GetLevel(),nullptr,4);auto product=cc->EvalMult(c,p);return cc->GetScheme()->ModReduceInternal(product,1); }
-Cipher MulScalar(const CryptoContext<DCRTPoly>&cc,const Cipher&c,double x){return MulPlain(cc,c,{x,x,x,x});}
-Cipher InnerRep(const CryptoContext<DCRTPoly>&cc,const Cipher&x,const Vec4&p){auto w=MulPlain(cc,x,p);auto s=cc->EvalAdd(w,cc->EvalRotate(w,1));return cc->EvalAdd(s,cc->EvalRotate(s,2));}
+Cipher AddAligned(const CryptoContext<DCRTPoly>&cc,Cipher lhs,Cipher rhs){ const auto target=std::max(lhs->GetLevel(),rhs->GetLevel()); if(lhs->GetLevel()<target)lhs=cc->GetScheme()->LevelReduceInternal(lhs,target-lhs->GetLevel()); if(rhs->GetLevel()<target)rhs=cc->GetScheme()->LevelReduceInternal(rhs,target-rhs->GetLevel()); return cc->EvalAdd(lhs,rhs); }
+Cipher SparseInnerPlain(const CryptoContext<DCRTPoly>&cc,const Cipher&state,const Vec4&row){
+ Cipher sum;
+ for(size_t j=0;j<4;++j){
+  Cipher rotated=(j==0)?state:cc->EvalRotate(state,static_cast<int32_t>(j));
+  Vec4 mask{}; mask[0]=row[j];
+  Cipher term=MulPlain(cc,rotated,mask);
+  sum=sum?AddAligned(cc,sum,term):term;
+ }
+ return sum;
+}
+Cipher SparseScalePlain(const CryptoContext<DCRTPoly>&cc,const Cipher&scalar,double coefficient){return MulPlain(cc,scalar,{coefficient,0.0,0.0,0.0});}
+Cipher ScatterPlain(const CryptoContext<DCRTPoly>&cc,const Cipher&scalar,const Vec4&column){
+ Cipher sum;
+ for(size_t row=0;row<4;++row){
+  Cipher placed=(row==0)?scalar:cc->EvalRotate(scalar,-static_cast<int32_t>(row));
+  Vec4 mask{}; mask[row]=column[row];
+  Cipher term=MulPlain(cc,placed,mask);
+  sum=sum?AddAligned(cc,sum,term):term;
+ }
+ return sum;
+}
 Cipher Reduce(const CryptoContext<DCRTPoly>&cc,Cipher c,uint32_t level){if(c->GetLevel()<level)c=cc->GetScheme()->LevelReduceInternal(c,level-c->GetLevel());return c;}
 
 void H4(std::ostream&o,const std::string&n){for(size_t i=0;i<4;++i)o<<','<<n<<'_'<<i;}
@@ -119,9 +140,9 @@ struct Csv { std::ofstream sample,block,boot,time,failure; };
 void OpenCsv(const Options&o,Csv&f){
  std::filesystem::create_directories(o.resultsDir);f.sample.open(o.resultsDir+"/sample_trace.csv");f.block.open(o.resultsDir+"/block_metrics.csv");f.boot.open(o.resultsDir+"/bootstrap_diagnostics.csv");f.time.open(o.resultsDir+"/timing.csv");f.failure.open(o.resultsDir+"/failure.csv");
  for(auto*s:{&f.sample,&f.block,&f.boot,&f.time,&f.failure})*s<<std::scientific<<std::setprecision(17);
- f.sample<<"block,within_block_sample,global_sample,y_plain,y_physical,y_semantic,epsilon_y,u_plain,u_semantic_exact,u_ckks,epsilon_u,epsilon_y_abs,epsilon_u_abs,u_slot_spread";for(auto n:{"plant_plain","plant_ckks","plant_error","u_decoded_slots"})H4(f.sample,n);HM(f.sample,"y");HM(f.sample,"u");f.sample<<'\n';
+ f.sample<<"block,within_block_sample,global_sample,y_plain,y_physical,y_semantic,epsilon_y,u_plain,u_semantic_exact,u_ckks,epsilon_u,epsilon_y_abs,epsilon_u_abs,y_active_error,y_inactive_leakage,u_active_error,u_inactive_leakage";for(auto n:{"plant_plain","plant_ckks","plant_error","y_decoded_slots","u_decoded_slots"})H4(f.sample,n);HM(f.sample,"y");HM(f.sample,"u");f.sample<<'\n';
  f.block<<"block";for(auto n:{"start_state","z_end","x_semantic_next","x_reconstructed","epsilon_x"})H4(f.block,n);for(auto n:{"E_start","E_end","Acl4_E_start","W_u","W_y","W_x","W_total","closure"})H8(f.block,n);f.block<<",epsilon_x_inf,E_start_inf,E_end_inf,W_u_inf,W_y_inf,W_x_inf,W_total_inf,closure_inf,semantic_identity_inf";HM(f.block,"x_next");f.block<<'\n';
- f.boot<<"block,within_block_sample,u_semantic";H4(f.boot,"u_pre");H4(f.boot,"u_post");f.boot<<",e_u_pre,e_u_boot,e_u_total,max_slot_spread";HM(f.boot,"before_reduction");HM(f.boot,"immediately_before_bootstrap");HM(f.boot,"after_bootstrap");f.boot<<",bootstrap_ms\n";
+ f.boot<<"block,within_block_sample,u_semantic";H4(f.boot,"u_pre");H4(f.boot,"u_post");f.boot<<",u_active_error_pre,u_inactive_leakage_pre,e_u_boot_inf,u_active_error_post,u_inactive_leakage_post";HM(f.boot,"before_reduction");HM(f.boot,"immediately_before_bootstrap");HM(f.boot,"after_bootstrap");f.boot<<",bootstrap_ms\n";
  f.time<<"block,u_evaluation_ms,u4_bootstrap_ms,u0_bootstrap_ms,u1_bootstrap_ms,u2_bootstrap_ms,u3_bootstrap_ms,reconstruction_ms,full_block_ms\n";
  f.failure<<"requested_mode,requested_blocks,completed_blocks,completed_samples,block,sample,stage,message";HM(f.failure,"last");f.failure<<'\n';
 }
@@ -140,34 +161,45 @@ int main(int argc,char**argv){
   uint32_t bootDepth=FHECKKSRNS::GetBootstrapDepth(budget,dist),depth=bootDepth+kLevelsAfterBootstrap,inputLevel=depth-1;
   CCParams<CryptoContextCKKSRNS>p;p.SetSecretKeyDist(dist);p.SetSecurityLevel(HEStd_NotSet);p.SetRingDim(4096);p.SetBatchSize(4);p.SetNumLargeDigits(3);p.SetKeySwitchTechnique(HYBRID);p.SetScalingTechnique(FLEXIBLEAUTO);p.SetScalingModSize(59);p.SetFirstModSize(60);p.SetMultiplicativeDepth(depth);
   auto cc=GenCryptoContext(p);cc->Enable(PKE);cc->Enable(KEYSWITCH);cc->Enable(LEVELEDSHE);cc->Enable(ADVANCEDSHE);cc->Enable(FHE);
-  bool doBoot=o.mode=="ckks_u4_bootstrap";if(doBoot)cc->EvalBootstrapSetup(budget,bsgs,4,kCorrectionFactor);auto kp=cc->KeyGen();cc->EvalMultKeyGen(kp.secretKey);cc->EvalRotateKeyGen(kp.secretKey,{1,2});if(doBoot)cc->EvalBootstrapKeyGen(kp.secretKey,4);
+  bool doBoot=o.mode=="ckks_u4_bootstrap";if(doBoot)cc->EvalBootstrapSetup(budget,bsgs,4,kCorrectionFactor);auto kp=cc->KeyGen();cc->EvalMultKeyGen(kp.secretKey);cc->EvalRotateKeyGen(kp.secretKey,{1,2,3,-1,-2,-3});if(doBoot)cc->EvalBootstrapKeyGen(kp.secretKey,4);
   std::cout<<std::setprecision(17)<<"OpenFHE_version=v1.5.1, source_commit=1306d14f8c26bb6150d3e6ad54f28dfe1007689e, library_version_string="<<GetOPENFHEVersion()<<", ring_dimension="<<cc->GetRingDimension()<<", logical_slots=4, depth="<<depth<<", bootstrap_depth="<<bootDepth<<", levels_after_bootstrap="<<kLevelsAfterBootstrap<<'\n';
   std::cout<<"profile="<<selectedProfile.name<<", label="<<selectedProfile.label<<", rho_F="<<rho_F<<", rho_Acl="<<rho_Acl<<", cond_O4="<<cond_O4<<"\n";
   std::cout<<"mode="<<o.mode<<", coeff_mode="<<o.coeffMode<<", blocks="<<o.blocks<<", scaling=FLEXIBLEAUTO, scaling_modulus_size=59, first_modulus_size=60, security=HEStd_NotSet\n";
-  std::cout<<"per_block_bootstraps: u="<<(doBoot?4:0)<<", x=0, y=0, r=0\nper_block_baseline_operations: plaintext_mult=18, rotations=8, additions=21, ct_ct_mult=0, relinearizations=0, explicit_rescales=18, bootstrap_input_normalization_calls="<<(doBoot?4:0)<<"\n";
+  std::cout<<"signal_representation: each y(t+i) and u(t+i) is a separate sparse scalar ciphertext [value,0,0,0]\n";
+  std::cout<<"per_block_bootstraps: u="<<(doBoot?4:0)<<", x=0, y=0, r=0\nper_block_baseline_operations: plaintext_mult=54, rotations=36, additions=49, ct_ct_mult=0, relinearizations=0, explicit_rescales=54, bootstrap_input_normalization_calls="<<(doBoot?4:0)<<"\n";
   std::cout<<"compiler="<<__VERSION__<<", hardware_concurrency="<<std::thread::hardware_concurrency();
 #ifdef _OPENMP
   std::cout<<", OpenMP_max_threads="<<omp_get_max_threads();
 #endif
   std::cout<<", OMP_NUM_THREADS="<<(std::getenv("OMP_NUM_THREADS")?std::getenv("OMP_NUM_THREADS"):"not set")<<'\n';
-  if(doBoot){gFailure.stage="bootstrap_warmup";auto c=Reduce(cc,EncryptRep(cc,kp.publicKey,.0125),inputLevel);auto d=cc->EvalBootstrap(c);(void)d;}
+  { // Verify the OpenFHE rotation convention used by the sparse layout.
+   const Vec4 probeState{1.0,2.0,3.0,4.0};
+   auto probe=EncryptVec(cc,kp.publicKey,probeState);
+   auto left=Decode(cc,kp.secretKey,cc->EvalRotate(probe,1));
+   auto sparse=EncryptSparseScalar(cc,kp.publicKey,1.0);
+   auto right=Decode(cc,kp.secretKey,cc->EvalRotate(sparse,-1));
+   if(std::abs(left[0]-2.0)>1e-6 || std::abs(right[1]-1.0)>1e-6)
+    throw std::runtime_error("rotation convention smoke check failed");
+   std::cout<<"rotation_smoke: Rot(+1) brings x2 to slot0; Rot(-1) moves sparse slot0 to slot1: PASS\n";
+  }
+  if(doBoot){gFailure.stage="bootstrap_warmup";auto c=Reduce(cc,EncryptSparseScalar(cc,kp.publicKey,.0125),inputLevel);auto d=cc->EvalBootstrap(c);(void)d;}
 
   Vec4 xp=Xp0,xc=Xc0,xpC=xp;auto anchor=EncryptVec(cc,kp.publicKey,xc);Vec4 anchorSem=Decode(cc,kp.secretKey,anchor);Mat8 acl=Acl(),acl4=Pow8(acl,4);bool smoke=false;
   for(size_t b=0;b<o.blocks;++b){
    auto blockBegin=Clock::now();gFailure.block=b;gFailure.sample=-1;gFailure.stage="block_start";double uMs=0,reconMs=0;std::array<double,4>bootMs{};Vec4 start=anchorSem,z=start,uSem{},ySem{};Vec8 eStart=Join(Sub(xpC,xp),Sub(start,xc)),wU{},wY{};std::array<Cipher,4>cu,cy;std::array<Vec4,4>du{};
    for(size_t i=0;i<4;++i){
-    gFailure.sample=i;gFailure.stage="sample";Vec4 xp0=xp,xpC0=xpC;double yp=Dot(C,xp),up=Dot(H,xc),yPhysical=Dot(C,xpC);cy[i]=EncryptRep(cc,kp.publicKey,yPhysical);auto ym=Meta(cy[i]);Vec4 dy=Decode(cc,kp.secretKey,cy[i]);ySem[i]=dy[0];double ey=ySem[i]-yPhysical;uSem[i]=Dot(H,z);
-    auto t=Clock::now();cu[i]=InnerRep(cc,anchor,P[i]);for(size_t j=0;j<i;++j)cu[i]=cc->EvalAdd(cu[i],MulScalar(cc,cy[j],q[i][j]));uMs+=Ms(t,Clock::now());auto um=Meta(cu[i]);du[i]=Decode(cc,kp.secretKey,cu[i]);double ua=du[i][0],eu=ua-uSem[i];
-    if(!smoke){double se=MaxErr(du[i],uSem[i]);Print4("scalar_smoke_u"+std::to_string(i),du[i]);std::cout<<"scalar_smoke_u"<<i<<"_expected="<<uSem[i]<<", max_abs_error="<<se<<", slot_spread="<<Spread(du[i])<<'\n';if(se>1e-5||Spread(du[i])>1e-5)throw std::runtime_error("replicated scalar u smoke diagnostic failed");}
+    gFailure.sample=i;gFailure.stage="sample";Vec4 xp0=xp,xpC0=xpC;double yp=Dot(C,xp),up=Dot(H,xc),yPhysical=Dot(C,xpC);cy[i]=EncryptSparseScalar(cc,kp.publicKey,yPhysical);auto ym=Meta(cy[i]);Vec4 dy=Decode(cc,kp.secretKey,cy[i]);ySem[i]=dy[0];double ey=ySem[i]-yPhysical;uSem[i]=Dot(H,z);
+    auto t=Clock::now();cu[i]=SparseInnerPlain(cc,anchor,P[i]);for(size_t j=0;j<i;++j)cu[i]=AddAligned(cc,cu[i],SparseScalePlain(cc,cy[j],q[i][j]));uMs+=Ms(t,Clock::now());auto um=Meta(cu[i]);du[i]=Decode(cc,kp.secretKey,cu[i]);double ua=du[i][0],eu=ua-uSem[i];
+    if(!smoke){double ae=ActiveError(du[i],uSem[i]),leak=InactiveLeakage(du[i]);Print4("sparse_scalar_smoke_u"+std::to_string(i),du[i]);std::cout<<"sparse_scalar_smoke_u"<<i<<"_expected="<<uSem[i]<<", active_error="<<ae<<", inactive_leakage="<<leak<<'\n';if(std::max(ae,leak)>1e-5)throw std::runtime_error("sparse scalar u smoke diagnostic failed");}
     wU=Add8(wU,Mv8(Pow8(acl,3-i),Join(Scale(B,eu),Vec4{})));wY=Add8(wY,Mv8(Pow8(acl,3-i),Join(Vec4{},Scale(G,ey))));
-    csv.sample<<b<<','<<i<<','<<b*4+i<<','<<yp<<','<<yPhysical<<','<<ySem[i]<<','<<ey<<','<<up<<','<<uSem[i]<<','<<ua<<','<<eu<<','<<std::abs(ey)<<','<<std::abs(eu)<<','<<Spread(du[i]);W(csv.sample,xp0);W(csv.sample,xpC0);W(csv.sample,Sub(xpC0,xp0));W(csv.sample,du[i]);WM(csv.sample,ym);WM(csv.sample,um);csv.sample<<'\n';csv.sample.flush();++gFailure.completedSamples;
+    csv.sample<<b<<','<<i<<','<<b*4+i<<','<<yp<<','<<yPhysical<<','<<ySem[i]<<','<<ey<<','<<up<<','<<uSem[i]<<','<<ua<<','<<eu<<','<<std::abs(ey)<<','<<std::abs(eu)<<','<<ActiveError(dy,yPhysical)<<','<<InactiveLeakage(dy)<<','<<ActiveError(du[i],uSem[i])<<','<<InactiveLeakage(du[i]);W(csv.sample,xp0);W(csv.sample,xpC0);W(csv.sample,Sub(xpC0,xp0));W(csv.sample,dy);W(csv.sample,du[i]);WM(csv.sample,ym);WM(csv.sample,um);csv.sample<<'\n';csv.sample.flush();++gFailure.completedSamples;
     xp=Add(Mv(A,xp),Scale(B,up));xc=Add(Mv(F,xc),Scale(G,yp));xpC=Add(Mv(A,xpC),Scale(B,ua));z=Add(Mv(F,z),Scale(G,ySem[i]));
    } smoke=true;
    std::array<Cipher,4>bu;
-   for(size_t i=0;i<4;++i){gFailure.sample=i;gFailure.stage="u_bootstrap_"+std::to_string(i);auto before=Meta(cu[i]);Cipher in=doBoot?Reduce(cc,cu[i],inputLevel):cu[i];auto immediate=Meta(in);Vec4 pre=Decode(cc,kp.secretKey,in);if(doBoot){auto t=Clock::now();bu[i]=cc->EvalBootstrap(in);bootMs[i]=Ms(t,Clock::now());}else bu[i]=in;auto after=Meta(bu[i]);gFailure.metadata=after;gFailure.hasMetadata=true;Vec4 post=Decode(cc,kp.secretKey,bu[i]);csv.boot<<b<<','<<i<<','<<uSem[i];W(csv.boot,pre);W(csv.boot,post);csv.boot<<','<<MaxErr(pre,uSem[i])<<','<<Inf(Sub(post,pre))<<','<<MaxErr(post,uSem[i])<<','<<Spread(post);WM(csv.boot,before);WM(csv.boot,immediate);WM(csv.boot,after);csv.boot<<','<<bootMs[i]<<'\n';csv.boot.flush();}
+   for(size_t i=0;i<4;++i){gFailure.sample=i;gFailure.stage="u_bootstrap_"+std::to_string(i);auto before=Meta(cu[i]);Cipher in=doBoot?Reduce(cc,cu[i],inputLevel):cu[i];auto immediate=Meta(in);Vec4 pre=Decode(cc,kp.secretKey,in);if(doBoot){auto t=Clock::now();bu[i]=cc->EvalBootstrap(in);bootMs[i]=Ms(t,Clock::now());}else bu[i]=in;auto after=Meta(bu[i]);gFailure.metadata=after;gFailure.hasMetadata=true;Vec4 post=Decode(cc,kp.secretKey,bu[i]);csv.boot<<b<<','<<i<<','<<uSem[i];W(csv.boot,pre);W(csv.boot,post);csv.boot<<','<<ActiveError(pre,uSem[i])<<','<<InactiveLeakage(pre)<<','<<Inf(Sub(post,pre))<<','<<ActiveError(post,uSem[i])<<','<<InactiveLeakage(post);WM(csv.boot,before);WM(csv.boot,immediate);WM(csv.boot,after);csv.boot<<','<<bootMs[i]<<'\n';csv.boot.flush();}
    gFailure.sample=4;gFailure.stage="column_reconstruction";auto rt=Clock::now();Cipher xu;
-   for(size_t j=0;j<4;++j){Vec4 col{};for(size_t i=0;i<4;++i)col[i]=M_u[i][j];auto term=MulPlain(cc,bu[j],col);xu=xu?cc->EvalAdd(xu,term):term;}
-   Cipher xy;for(size_t j=0;j<4;++j){Vec4 col{};for(size_t i=0;i<4;++i)col[i]=M_y[i][j];auto term=MulPlain(cc,cy[j],col);xy=xy?cc->EvalAdd(xy,term):term;}xy=Reduce(cc,xy,xu->GetLevel());anchor=cc->EvalAdd(xu,xy);reconMs=Ms(rt,Clock::now());auto xm=Meta(anchor);Vec4 decoded=Decode(cc,kp.secretKey,anchor);anchorSem=decoded;Vec4 xSemantic=Add(Mv(M_u,uSem),Mv(M_y,ySem)),epsX=Sub(decoded,xSemantic);Vec8 eEnd=Join(Sub(xpC,xp),Sub(decoded,xc)),prop=Mv8(acl4,eStart),wX=Join(Vec4{},epsX),wTot=Add8(Add8(wU,wY),wX),closure=Sub8(Sub8(eEnd,prop),wTot);
+   for(size_t j=0;j<4;++j){Vec4 col{};for(size_t i=0;i<4;++i)col[i]=M_u[i][j];auto term=ScatterPlain(cc,bu[j],col);xu=xu?AddAligned(cc,xu,term):term;}
+   Cipher xy;for(size_t j=0;j<4;++j){Vec4 col{};for(size_t i=0;i<4;++i)col[i]=M_y[i][j];auto term=ScatterPlain(cc,cy[j],col);xy=xy?AddAligned(cc,xy,term):term;}anchor=AddAligned(cc,xu,xy);reconMs=Ms(rt,Clock::now());auto xm=Meta(anchor);Vec4 decoded=Decode(cc,kp.secretKey,anchor);anchorSem=decoded;Vec4 xSemantic=Add(Mv(M_u,uSem),Mv(M_y,ySem)),epsX=Sub(decoded,xSemantic);Vec8 eEnd=Join(Sub(xpC,xp),Sub(decoded,xc)),prop=Mv8(acl4,eStart),wX=Join(Vec4{},epsX),wTot=Add8(Add8(wU,wY),wX),closure=Sub8(Sub8(eEnd,prop),wTot);
    csv.block<<b;W(csv.block,start);W(csv.block,z);W(csv.block,xSemantic);W(csv.block,decoded);W(csv.block,epsX);W(csv.block,eStart);W(csv.block,eEnd);W(csv.block,prop);W(csv.block,wU);W(csv.block,wY);W(csv.block,wX);W(csv.block,wTot);W(csv.block,closure);csv.block<<','<<Inf(epsX)<<','<<Inf8(eStart)<<','<<Inf8(eEnd)<<','<<Inf8(wU)<<','<<Inf8(wY)<<','<<Inf8(wX)<<','<<Inf8(wTot)<<','<<Inf8(closure)<<','<<Inf(Sub(xSemantic,z));WM(csv.block,xm);csv.block<<'\n';csv.block.flush();
    double bt=bootMs[0]+bootMs[1]+bootMs[2]+bootMs[3];csv.time<<b<<','<<uMs<<','<<bt;for(double x:bootMs)csv.time<<','<<x;csv.time<<','<<reconMs<<','<<Ms(blockBegin,Clock::now())<<'\n';csv.time.flush();++gFailure.completedBlocks;
    std::cout<<"block="<<b<<", epsilon_x_inf="<<Inf(epsX)<<", closure_inf="<<Inf8(closure)<<", semantic_identity_inf="<<Inf(Sub(xSemantic,z))<<", u4_bootstrap_ms="<<bt<<", x_level="<<xm.level<<", x_towers="<<xm.towers<<'\n';
