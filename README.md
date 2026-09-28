@@ -18,29 +18,25 @@ $u,y$ history를 이용한 controller-state reconstruction과 CKKS 기반 암호
 
 Plant는 다음과 같은 discrete-time LTI system을 사용합니다.
 
-$$
+```math
 x_p(k+1)=Ax_p(k)+Bu(k),
-$$
-
-$$
+```
+```math
 y(k)=Cx_p(k).
-$$
-
+```
 동적 제어기는
 
-$$
+```math
 x_c(k+1)=Fx_c(k)+Gy(k),
-$$
-
-$$
+```
+```math
 u(k)=Hx_c(k)
-$$
-
+```
 형태입니다.
 
 전체 closed-loop dynamics는
 
-$$
+```math
 \begin{bmatrix}
 x_p(k+1)\\
 x_c(k+1)
@@ -55,14 +51,12 @@ GC & F
 x_p(k)\\
 x_c(k)
 \end{bmatrix}.
-$$
-
+```
 이 저장소에서는 특히
 
-$$
+```math
 \rho(F)>1,\qquad \rho(A_{\mathrm{cl}})<1
-$$
-
+```
 인 controller realization에서도 암호화 구현이 어떻게 동작하는지 살펴봅니다.
 
 즉, **closed loop는 안정하지만 controller realization 내부에는 unstable mode가 존재할 수 있는 경우**를 주요 관심 대상으로 둡니다.
@@ -77,32 +71,28 @@ $$
 
 내부 controller matrix $F$가 Schur stable인 기준 case입니다.
 
-$$
+```math
 \rho(F)<1.
-$$
-
+```
 암호화 구현에서 가장 안정적인 baseline으로 사용합니다.
 
 ---
 
 ### `unstable_low`
 
-$$
+```math
 \rho(F)>1
-$$
-
+```
 이지만 finite-horizon 내부 증폭이 비교적 작은 controller realization입니다.
 
 현재 설정에서는
 
-$$
+```math
 \rho(F)\approx 1.0460,
-$$
-
-$$
+```
+```math
 \rho(A_{\mathrm{cl}})\approx 0.7852.
-$$
-
+```
 즉 controller 내부 $F$는 unstable이지만 전체 physical closed loop는 stable입니다.
 
 ---
@@ -148,20 +138,18 @@ $$
 
 기본 controller:
 
-$$
+```math
 x_c(k+1)=Fx_c(k)+Gy(k),
 \qquad
 u(k)=Hx_c(k).
-$$
-
+```
 TAC 형태:
 
-$$
+```math
 x_c(k+1)
 =
 (F-RH)x_c(k)+Gy(k)+Ru(k).
-$$
-
+```
 이 단계의 목적은 **controller reformulation 자체가 원래 controller와 동등함을 확인하는 것**입니다.
 
 ### 실행 예시
@@ -192,16 +180,14 @@ sample_trace.csv
 
 여기서
 
-$$
+```math
 e_u(k)=u_{\mathrm{test}}(k)-u_{\mathrm{ref}}(k)
-$$
-
+```
 및
 
-$$
+```math
 e_p(k)=x_{p,\mathrm{test}}(k)-x_{p,\mathrm{ref}}(k)
-$$
-
+```
 를 확인할 수 있습니다.
 
 Plain arithmetic에서는 정상 구현 시 두 오차가 floating-point roundoff 수준이어야 합니다.
@@ -220,7 +206,7 @@ Plain arithmetic에서는 정상 구현 시 두 오차가 floating-point roundof
 
 Reconstruction horizon을 $\nu$라고 하면
 
-$$
+```math
 U_t=
 \begin{bmatrix}
 u(t)\\
@@ -228,9 +214,8 @@ u(t+1)\\
 \vdots\\
 u(t+\nu-1)
 \end{bmatrix},
-$$
-
-$$
+```
+```math
 Y_t=
 \begin{bmatrix}
 y(t)\\
@@ -238,11 +223,10 @@ y(t+1)\\
 \vdots\\
 y(t+\nu-1)
 \end{bmatrix}.
-$$
-
+```
 Observability matrix는
 
-$$
+```math
 \mathcal O_\nu=
 \begin{bmatrix}
 H\\
@@ -250,26 +234,23 @@ HF\\
 \vdots\\
 HF^{\nu-1}
 \end{bmatrix}.
-$$
-
+```
 $\mathcal O_\nu$가 full column rank이면
 
-$$
+```math
 U_t
 =
 \mathcal O_\nu x_c(t)+T_\nu Y_t
-$$
-
+```
 로부터 controller state를 복원할 수 있습니다.
 
 결과적으로
 
-$$
+```math
 x_c(t+\nu)
 =
 M_uU_t+M_yY_t
-$$
-
+```
 형태의 reconstruction을 얻습니다.
 
 ---
@@ -283,18 +264,16 @@ $$
 
 따라서 반드시
 
-$$
+```math
 K=\nu
-$$
-
+```
 일 필요는 없습니다.
 
 예를 들어
 
-$$
+```math
 K=12,\qquad \nu=4
-$$
-
+```
 처럼 설정할 수도 있습니다.
 
 ### 실행 예시
@@ -346,21 +325,19 @@ Part 2의 $u,y$-reconstruction 구조를 CKKS ciphertext에 적용합니다.
 
 예를 들어
 
-$$
+```math
 P_i x_c
-$$
-
+```
 연산은
 
-$$
+```math
 \operatorname{pt}(P_i)\odot c_x
-$$
-
+```
 형태로 수행합니다.
 
 Reconstruction도
 
-$$
+```math
 c_{x,\mathrm{next}}
 =
 \sum_i
@@ -372,8 +349,7 @@ Boot(c_{u_i})
 \operatorname{pt}(M_y[:,i])
 \odot
 c_{y_i}
-$$
-
+```
 형태입니다.
 
 따라서 이 단계는 **CKKS encrypted-state implementation의 baseline**으로 사용할 수 있습니다.
@@ -430,18 +406,16 @@ export OPENFHE_ROOT="$HOME/openfhe-development"
 
 즉
 
-$$
+```math
 Enc(P_i)\odot Enc(x_c)
-$$
-
+```
 및
 
-$$
+```math
 Enc(M_u[:,i])
 \odot
 Boot(c_{u_i})
-$$
-
+```
 와 같은 ciphertext-ciphertext multiplication을 사용합니다.
 
 이 구현이 현재 장기 numerical-error 분석의 주요 대상입니다.
@@ -485,34 +459,30 @@ Reference plant trajectory와 test/encrypted plant trajectory를 비교합니다
 
 ### `u_error.png`
 
-$$
+```math
 |u_{\mathrm{test}}(k)-u_{\mathrm{ref}}(k)|
-$$
-
+```
 를 표시합니다.
 
 ### `plant_state_error.png`
 
-$$
+```math
 \|x_{p,\mathrm{test}}(k)-x_{p,\mathrm{ref}}(k)\|_\infty
-$$
-
+```
 를 표시합니다.
 
 이 저장소에서는 **controller-state error 자체를 최종 성공/실패 지표로 사용하지 않습니다.**
 
 주요 성능 평가는
 
-$$
+```math
 u(k)
-$$
-
+```
 와
 
-$$
+```math
 x_p(k)
-$$
-
+```
 의 차이를 기준으로 합니다.
 
 Controller-state numerical error는 내부 오차 메커니즘을 분석하기 위한 diagnostic으로 사용합니다.
@@ -523,47 +493,42 @@ Controller-state numerical error는 내부 오차 메커니즘을 분석하기 �
 
 현재 `unstable_low` ct-ct 실험에서는 block 단위 controller-internal numerical error가
 
-$$
+```math
 F^K
-$$
-
+```
 의 unstable mode와 매우 유사한 증가율을 보였습니다.
 
 특히 $K=4$인 경우
 
-$$
+```math
 \rho(F)^4
 \approx 1.19728
-$$
-
+```
 이며, 실제 same-measurement reference와의 controller-state numerical error에서도 이에 매우 가까운 block-wise growth가 반복적으로 관찰되었습니다.
 
 이 현상을 수식적으로 보면, 새로운 HE error가 없다고 가정한 경우 inherited controller-state error는
 
-$$
+```math
 \delta x_{j+1}
 =
 F^K\delta x_j
-$$
-
+```
 형태로 전달될 수 있습니다.
 
 다만 이것이 곧바로
 
-$$
+```math
 \rho(F)>1
 \Rightarrow
 \mathrm{physical\ closed\!-\!loop\ failure}
-$$
-
+```
 를 의미하는 것은 아닙니다.
 
 Physical closed-loop stability는
 
-$$
+```math
 A_{\mathrm{cl}}
-$$
-
+```
 에 의해 결정되며, 실제 암호화 구현에서는
 
 - controller-internal numerical error
@@ -604,10 +569,9 @@ Bootstrap 이후 남는 RNS tower/modulus budget을 변경해 error growth의 �
 
 하나의 scalar control $u_i$를 표현하는 ciphertext가 이상적으로
 
-$$
+```math
 [u_i,u_i,u_i,u_i]
-$$
-
+```
 형태를 유지하는지 확인합니다.
 
 실제 CKKS 연산에서는 slot별 오차가 다르게 발생할 수 있으므로, 이를 actuator-visible scalar control error와 controller-internal representation error로 나누어 분석합니다.
@@ -664,34 +628,29 @@ OpenFHE 환경을 준비한 뒤
 
 `stable`, `unstable_low`, `unstable_high`를 비교할 때 단순히
 
-$$
+```math
 \rho(F)
-$$
-
+```
 만 보는 것은 충분하지 않습니다.
 
 특히 unstable realization에서는 다음 값들도 함께 확인하는 것이 좋습니다.
 
-$$
+```math
 \max_{1\le i\le K}\|F^i\|,
-$$
-
-$$
+```
+```math
 \|M_u\|,
-$$
-
-$$
+```
+```math
 \operatorname{cond}(\mathcal O_\nu),
-$$
-
+```
 그리고 실제 encrypted implementation에서의
 
-$$
+```math
 |e_u(k)|,
 \qquad
 \|e_p(k)\|_\infty.
-$$
-
+```
 `unstable_low`와 `unstable_high`는 가능한 한 동일한 ideal closed-loop behavior를 유지하면서 controller realization의 internal numerical amplification 차이를 비교하기 위한 profile입니다.
 
 ---
@@ -704,26 +663,23 @@ $$
 
 특히 일반적인 $K,\nu$에서
 
-$$
+```math
 \delta x_{j+1}
 =
 F^K\delta x_j+d_j
-$$
-
+```
 형태의 controller-internal error model을 분석하고,
 
 이를 실제 control error
 
-$$
+```math
 e_u
-$$
-
+```
 및 plant-state error
 
-$$
+```math
 e_p
-$$
-
+```
 로 연결하는 것이 현재 분석의 주요 방향입니다.
 
 ---
